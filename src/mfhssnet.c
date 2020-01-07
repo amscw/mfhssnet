@@ -1,5 +1,3 @@
-#include "mfhssnet.h"
-
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/sched.h>
@@ -10,24 +8,13 @@
 #include <linux/tcp.h>			// struct tcphdr
 #include <linux/skbuff.h>
 
+#include "mfhssnet.h"
+#include "mfhssfs.h"
+#include "pool.h"
+
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("amscw");			// https://github.com/amscw
-
-//-------------------------------------------------------------------------------------------------
-// MACRO
-//-------------------------------------------------------------------------------------------------
-#define POOL_SIZE	8
-
-//-------------------------------------------------------------------------------------------------
-// Types
-//-------------------------------------------------------------------------------------------------
-struct mfhss_pkt_
-{
-	struct mfhss_pkt_ *next;
-	struct net_device *dev;
-	int datalen;
-	u8 data[ETH_DATA_LEN];
-};
 
 //-------------------------------------------------------------------------------------------------
 // Prototypes
@@ -40,8 +27,7 @@ static int mfhss_ioctl(struct net_device *dev, struct ifreq *req, int cmd);
 static int mfhss_change_mtu(struct net_device *dev, int new_mtu);
 static void mfhss_tx_timeout(struct net_device *dev);
 static struct net_device_stats *mfhss_stats(struct net_device *dev);
-// int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
-// 	const void *pDAddr, const void *pSAddr, unsigned len);
+static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned short type, const void *daddr, const void *saddr, unsigned len);
 
 //-------------------------------------------------------------------------------------------------
 // Varibles
@@ -58,10 +44,10 @@ static const struct net_device_ops mfhss_net_device_ops = {
  	.ndo_change_mtu      = mfhss_change_mtu,
  	.ndo_tx_timeout      = mfhss_tx_timeout
 };
-// static const struct header_ops dummyHeaderOps = {
-//     .create  = dumHeader,
-//     .cache = NULL,
-// };
+static const struct header_ops mfhss_header_ops = {
+    .create  = mfhss_header,
+    .cache = NULL,
+};
 static int timeout = DUMMY_NETDEV_TIMEOUT;
 static unsigned long trans_start;
 
@@ -69,108 +55,7 @@ static unsigned long trans_start;
 // Functions
 //-------------------------------------------------------------------------------------------------
 /*
- * Packet management functions
- */
-static void pool_create(struct net_device *dev)
-{
-	int i;
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-	struct mfhss_pkt_ *pkt;
-
-	priv->pool = NULL;
-	for (i = 0; i < POOL_SIZE; i++)
-	{
-		pkt = kmalloc(sizeof (struct mfhss_pkt_), GFP_KERNEL);
-		if (pkt == NULL)
-		{
-			// PRINT_STATUS_MSG("cannot allocate packet #%i (%ld bytes)", -ENOMEM, i, sizeof (struct dumPacket_));
-			return;
-		}
-		pkt->dev = dev;
-		pkt->next = priv->pool;
-		priv->pool = pkt;
-	}
-}
-
-static void pool_destroy(struct net_device *dev) 
-{
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-	struct mfhss_pkt_ *pkt;
-
-	while((pkt = priv->pool) != NULL) {
-		priv->pool = pkt->next;
-		kfree(pkt);
-		// FIXME: in-flight packets (currently used)?
-	}
-}
-
-static struct mfhss_pkt_ * pool_get(struct net_device *dev)
-{
-	unsigned long flags = 0;
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-	struct mfhss_pkt_ *pkt;
-	
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt = priv->pool;
-	if (pkt == NULL)
-	{
-		// PRINT_STATUS_MSG("pool is empty", -1);
-		netif_stop_queue(dev);
-	} else {
-		priv->pool = pkt->next;
-		pkt->next = NULL;
-	}
-	spin_unlock_irqrestore(&priv->lock, flags);
-	return pkt;
-}
-
-static void pool_put(struct mfhss_pkt_ *pkt)
-{
-	unsigned long flags = 0;
-	struct mfhss_priv_ *priv;
-	
-	if (pkt != NULL)
-	{
-		priv = netdev_priv(pkt->dev);
-		spin_lock_irqsave(&priv->lock, flags);
-		pkt->next = priv->pool;
-		priv->pool = pkt;
-		spin_unlock_irqrestore(&priv->lock, flags);
-		if (netif_queue_stopped(pkt->dev) && pkt->next == NULL)
-			netif_wake_queue(pkt->dev);
-	}
-}
-
-static void enqueue_pkt(struct net_device *dev, struct mfhss_pkt_ *pkt)
-{
-	unsigned long flags = 0;
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-
-	spin_lock_irqsave(&priv->lock, flags);
-	pkt->next = priv->rx_queue;
-	priv->rx_queue = pkt;
-	spin_unlock_irqrestore(&priv->lock, flags);
-}
-
-static struct mfhss_pkt_ *dequeue_pkt(struct net_device *dev)
-{
-	unsigned long flags = 0;
-	struct mfhss_pkt_ *pkt;
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-	
-	// spin_lock_irqsave(&pPriv->lock, flags);
-	pkt = priv->rx_queue;
-	if (pkt != NULL)
-	{
-		priv->rx_queue = pkt->next;
-		pkt->next = NULL;
-	}
-	// spin_unlock_irqrestore(&pPriv->lock, flags);
-	return pkt;
-}
-
-/*
- * Net device functionality support
+ * Net device support
  */
 // static void rxIntEn(struct net_device *pDev, int bIsEnable)
 // {
@@ -324,9 +209,21 @@ static struct mfhss_pkt_ *dequeue_pkt(struct net_device *dev)
 // 	return;
 // }
 
- 
+static void mfhss_cleanup(void)
+{
+	if (mfhss_dev != NULL) 
+	{
+		unregister_netdev(mfhss_dev);
+		pool_destroy(mfhss_dev);
+		free_netdev(mfhss_dev);
+		mfhss_dev = NULL;
+	}
+
+}
+
 static void mfhss_setup(struct net_device *dev)
 {
+	int err = 0;
 	// The init function (sometimes called probe).
 	// It is invoked by register_netdev()
 	struct mfhss_priv_ *priv = netdev_priv(dev);
@@ -353,25 +250,12 @@ static void mfhss_setup(struct net_device *dev)
 	dev->flags |= IFF_NOARP;
 	dev->features |= NETIF_F_HW_CSUM;
 	
-	// dev->netdev_ops = &dummyNetdevOps;
-	// dev->header_ops = &dummyHeaderOps;
+	dev->netdev_ops = &mfhss_net_device_ops;
+	dev->header_ops = &mfhss_header_ops;
 	
 	// rxIntEn(pDev, 1);	// enable receive interrupts
-	pool_create(dev);
-	// PRINT_STATUS(0);
-}
-
-static void mfhss_cleanup(void)
-{
-	// int i;
-	// PRINT_STATUS(0);    
-	// for (i = 0; i < 2;  i++) {
-	// 	if (dummyDevs[i]) {
-	// 		unregister_netdev(dummyDevs[i]);
-	// 		destroyPool(dummyDevs[i]);
-	// 		free_netdev(dummyDevs[i]);
-	// 	}
-	// }
+	err = pool_create(dev, ETH_DATA_LEN);
+	PRINT_ERR(err);
 }
 	
 /*
@@ -380,6 +264,7 @@ static void mfhss_cleanup(void)
 
 static int mfhss_open(struct net_device *dev) 
 {
+	int err = EBUSY;
 	// request_region(), request_irq(), ...
 
 	// Assign the hardware address
@@ -388,8 +273,8 @@ static int mfhss_open(struct net_device *dev)
 		dev->dev_addr[0], dev->dev_addr[1], dev->dev_addr[2], dev->dev_addr[3], dev->dev_addr[4], dev->dev_addr[5],
 		dev->name);
 	netif_start_queue(dev);
-	// PRINT_STATUS(0);
-	return 0;
+	PRINT_ERR(err);
+	return -err;
 }
 
 static int mfhss_close(struct net_device *dev)
@@ -402,20 +287,22 @@ static int mfhss_close(struct net_device *dev)
 
 static int mfhss_config(struct net_device *dev, struct ifmap *map)
 {
-	int err;
+	int err = 0;
 
 	// PDEBUG("configure the device %s", pDev->name);
 	if (dev->flags & IFF_UP)
 	{
 		// can't act on a running interface
-		PRINT_STATUS(err = -EBUSY);
-		return err;
+		err = EBUSY;
+		PRINT_ERR(err);
+		return -err;
 	} 
 
 	if (map->base_addr != dev->base_addr) {
 		// can't change I/O address
-		PRINT_STATUS(err = -EOPNOTSUPP);
-		return err;
+		err = EOPNOTSUPP;
+		PRINT_ERR(err);
+		return -err;
 	} 
 
 	if (map->irq != dev->irq) {
@@ -424,8 +311,8 @@ static int mfhss_config(struct net_device *dev, struct ifmap *map)
 	}
 
 	// ignore other fields
-	PRINT_STATUS(0);
-	return 0;
+	PRINT_ERR(err);
+	return err;
 }
 
 // int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
@@ -471,7 +358,7 @@ static int mfhss_change_mtu(struct net_device *dev, int new_mtu)
 	// PDEBUG("set new MTU=%i to %s", newMTU, pDev->name);
 	if ((new_mtu < 68) || (new_mtu > 1500))
 	{
-		PRINT_STATUS_MSG("MTU is out if range (68, 1500): %i", (err=-EINVAL), new_mtu);
+		// PRINT_STATUS_MSG("MTU is out if range (68, 1500): %i", (err=-EINVAL), new_mtu);
 		return err;
 	}
 
@@ -507,63 +394,57 @@ static struct net_device_stats *mfhss_stats(struct net_device *dev)
 /*
  * Header operations
  */
-// int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
-// 	const void *pDAddr, const void *pSAddr, unsigned len)
-// {
-// 	// PDEBUG("build ethernet header for %s", pDev->name);
-// 	struct ethhdr *pEth = (struct ethhdr *)skb_push(pSkB, ETH_HLEN);
+static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned short type, const void *daddr, const void *saddr, unsigned len)
+{
+	struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
 
-// 	pEth->h_proto = htons(type);
-// 	memcpy(pEth->h_source, pSAddr ? pSAddr : pDev->dev_addr, pDev->addr_len);
-// 	memcpy(pEth->h_dest, pDAddr ? pDAddr : pDev->dev_addr, pDev->addr_len);
-// 	pEth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
-// 	return (pDev->hard_header_len);
-// }
+	eth->h_proto = htons(type);
+	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
+	memcpy(eth->h_dest, daddr ? daddr : dev->dev_addr, dev->addr_len);
+	eth->h_dest[ETH_ALEN-1]   ^= 0x01;   /* dest is us xor 1 */
+	return (dev->hard_header_len);
+}
+
+/*
+ * Platform device support
+ */
+
 
 /*
  * Entry/exit point functions
  */
 static int mfhss_init(void)
 {
-	int err = 0, i;
+	int err = 0;
 
-	// Define interrupt
-	// dummyNetdevInterrupt = regularIntHandler;
-
-	// Allocate devices
+	// Allocate the device
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
-	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "dm%d", mfhss_setup);
+	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", mfhss_setup);
 #else
-	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "dm%d", NET_NAME_UNKNOWN, mfhss_setup);
+	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", NET_NAME_UNKNOWN, mfhss_setup);
 #endif
 	if (mfhss_dev == NULL)
 	{
-		err = -ENOMEM;
-		// PRINT_STATUS_MSG("cannot allocate struct dummyNet_priv_ (err=%d)", err, err);
-		// dumCleanup();
-		return err;
-	} else {
-		// PDEBUG("mfhss_dev allocated at 0x%p (%ld bytes)", i, mfhss_dev, sizeof *mfhss_dev);
-	}
+		err = ENOMEM;
+		PRINT_ERR(err);
+		return -err;
+	} else PDEBUG("net device structure allocated at 0x%p (%ld bytes)", mfhss_dev, sizeof *mfhss_dev);
 
 	// Register devices
 	if ((err = register_netdev(mfhss_dev)) != 0)
 	{
-		// PRINT_STATUS_MSG("cannot register net device (err=%d)", err, err);
-		// dumCleanup();
-		return err;
-	} else {
-		PDEBUG("mfhss_dev successfully registered!");
-	}
+		PRINT_ERR(err);
+		mfhss_cleanup();
+		return -err;
+	} else PDEBUG("%s successfully registered!", mfhss_dev->name);
 
-	//PRINT_STATUS(err);
-	return 0;
+	PRINT_ERR(err);
+	return -err;
 }
 
 static void mfhss_exit(void)
 {	
-	// dumCleanup();
-	// PRINT_STATUS(0);
+	mfhss_cleanup();
 }
 
 module_init(mfhss_init);
