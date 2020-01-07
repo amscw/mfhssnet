@@ -20,7 +20,15 @@
 struct net_device;
 struct net_device_stats;
 struct sk_buff;
-struct mfhss_pkt_;
+
+// Payload data packet structure
+struct mfhss_pkt_
+{
+	struct mfhss_pkt_ *next;
+	struct net_device *dev;
+	int datalen;
+	u8 *data; //ETH_DATA_LEN
+};
 
 // Main device structure
 struct mfhss_priv_ {
@@ -36,6 +44,7 @@ struct mfhss_priv_ {
 	struct sk_buff *skb;
 	spinlock_t lock;
 };
+
 
 //-------------------------------------------------------------------------------------------------
 // Varibles
