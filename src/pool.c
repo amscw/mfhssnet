@@ -1,5 +1,6 @@
 #include "mfhssnet.h"
 #include "pool.h"
+#include <linux/netdevice.h> // выкинуть нахер отсюда, ввести дескриптор пула 
 
 //-------------------------------------------------------------------------------------------------
 // Functions
@@ -33,6 +34,7 @@ int pool_create(struct net_device *dev, size_t datalen)
 		pkt->next = priv->pool;
 		priv->pool = pkt;
 	}
+	return 0;
 }
 
 void pool_destroy(struct net_device *dev) 
