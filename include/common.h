@@ -17,9 +17,9 @@
 #define PINFO(fmt,args...) printk(KERN_INFO"%s:"fmt,DRIVER_NAME, ##args)
 
 #define MAX_ERR	35
-#define PRINT_ERR(err) printk(KERN_ERR"%s(%s)-[%02d(%s)]\n", DRIVER_NAME, __FUNCTION__, err,\
+#define PRINT_ERR(err) printk(KERN_ERR"%s(%s)-[%02d/%s]\n", DRIVER_NAME, __FUNCTION__, (err),\
 	(err < MAX_ERR) ? err_strings[err] : "unknown")
-#define PRINT_ERR_MSG(err) printk(KERN_ERR"%s(%s)-[%02d(%s)] %s\n", DRIVER_NAME, __FUNCTION__, err,\
+#define PRINT_ERR_MSG(err) printk(KERN_ERR"%s(%s)-[%02d/%s] %s\n", DRIVER_NAME, __FUNCTION__, err,\
 	(err < MAX_ERR) ? err_strings[err] : "unknown", (err < MAX_ERR) ? err_messages[err] : "description unavailable, see uapi/asm-generic/errno.h")
 
 //-------------------------------------------------------------------------------------------------
