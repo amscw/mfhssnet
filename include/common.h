@@ -15,17 +15,17 @@
 #define PDEBUG(fmt,args...) printk(KERN_DEBUG"%s(%s):"fmt, DRIVER_NAME, __FUNCTION__, ##args)
 #define PERR(fmt,args...) printk(KERN_ERR"%s(%s):"fmt, DRIVER_NAME, __FUNCTION__, ##args)
 #define PINFO(fmt,args...) printk(KERN_INFO"%s:"fmt,DRIVER_NAME, ##args)
-#define PRINT_STATUS_MSG(fmt, err, args...) printk(KERN_DEBUG"%s(%s)-[%s] "fmt"\n", DRIVER_NAME, __FUNCTION__, err ? messages[MSG_FAIL] : messages[MSG_OK], ##args)
-#define PRINT_STATUS(err) PRINT_STATUS_MSG("", (err)) 
 
-//-------------------------------------------------------------------------------------------------
-// Types
-//-------------------------------------------------------------------------------------------------
-enum message_index_ { MSG_OK, MSG_FAIL };
+#define MAX_ERR	35
+#define PRINT_ERR(err) printk(KERN_ERR"%s(%s)-[%02d(%s)]\n", DRIVER_NAME, __FUNCTION__, err,\
+	(err < MAX_ERR) ? err_strings[err] : "unknown")
+#define PRINT_ERR_MSG(err) printk(KERN_ERR"%s(%s)-[%02d(%s)] %s\n", DRIVER_NAME, __FUNCTION__, err,\
+	(err < MAX_ERR) ? err_strings[err] : "unknown", (err < MAX_ERR) ? err_messages[err] : "description unavailable, see uapi/asm-generic/errno.h")
 
 //-------------------------------------------------------------------------------------------------
 // Varibles
 //-------------------------------------------------------------------------------------------------
-extern const char* messages[];
+extern const char* const err_strings[];
+extern const char* const err_messages[];
 
 #endif // _COMMON_H
