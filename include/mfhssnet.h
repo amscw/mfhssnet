@@ -24,10 +24,10 @@ struct sk_buff;
 // Payload data packet structure
 struct mfhss_pkt_
 {
-	struct mfhss_pkt_ *next;
 	struct net_device *dev;
 	int datalen;
 	u8 *data; //ETH_DATA_LEN
+	struct list_head list;
 };
 
 // Main device structure

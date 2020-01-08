@@ -213,20 +213,22 @@ static void mfhss_cleanup(void)
 {
 	if (mfhss_dev != NULL) 
 	{
-		unregister_netdev(mfhss_dev);
-		pool_destroy(mfhss_dev);
+		// unregister_netdev(mfhss_dev);
+		pool_destroy();
 		free_netdev(mfhss_dev);
 		mfhss_dev = NULL;
 	}
 
 }
 
+// this callback called after allocation net_device structure
 static void mfhss_setup(struct net_device *dev)
 {
 	int err = 0;
 	// The init function (sometimes called probe).
 	// It is invoked by register_netdev()
 	struct mfhss_priv_ *priv = netdev_priv(dev);
+	struct mfhss_pkt_ *pkt;
 
 	// Then, initialize the priv field. This encloses the statistics and a few private fields.
 
@@ -255,7 +257,21 @@ static void mfhss_setup(struct net_device *dev)
 	
 	// rxIntEn(pDev, 1);	// enable receive interrupts
 	err = pool_create(dev, ETH_DATA_LEN);
+	pkt = pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	pool_get();
+	PDEBUG("now try put one: %li", pool_put(pkt));
+	pool_get();
+	pool_get();
+
 	PRINT_ERR(err);
+	
 }
 	
 /*
@@ -413,7 +429,7 @@ static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned sh
 /*
  * Entry/exit point functions
  */
-static int mfhss_init(void)
+static __init int mfhss_init(void)
 {
 	int err = 0;
 
@@ -425,24 +441,22 @@ static int mfhss_init(void)
 #endif
 	if (mfhss_dev == NULL)
 	{
-		err = ENOMEM;
-		PRINT_ERR(err);
+		PRINT_ERR(err = -ENOMEM);
 		return -err;
 	} else PDEBUG("net device structure allocated at 0x%p (%ld bytes)", mfhss_dev, sizeof *mfhss_dev);
 
 	// Register devices
-	if ((err = register_netdev(mfhss_dev)) != 0)
-	{
-		PRINT_ERR(err);
-		mfhss_cleanup();
-		return -err;
-	} else PDEBUG("%s successfully registered!", mfhss_dev->name);
-
+	// if ((err = register_netdev(mfhss_dev)) != 0)
+	// {
+	// 	PRINT_ERR(err);
+	// 	mfhss_cleanup();
+	// 	return -err;
+	// } else PDEBUG("%s successfully registered!", mfhss_dev->name);
 	PRINT_ERR(err);
-	return -err;
+	return err;
 }
 
-static void mfhss_exit(void)
+static __exit void mfhss_exit(void)
 {	
 	mfhss_cleanup();
 }
