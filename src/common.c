@@ -34,6 +34,7 @@ const char * const err_strings[] = {
 	"EPIPE",		/* 32 */
 	"EDOM",			/* 33 */
 	"ERANGE",		/* 34 */
+	"unknown",
 };
 
 const char * const err_messages[] = {
@@ -71,5 +72,6 @@ const char * const err_messages[] = {
 	"Too many links",
 	"Broken pipe",
 	"Math argument out of domain of func",
-	"Math result not representable"
+	"Math result not representable",
+	"description unavailable, see uapi/asm-generic/errno.h",
 };
