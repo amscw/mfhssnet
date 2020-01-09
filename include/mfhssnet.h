@@ -20,6 +20,7 @@
 struct net_device;
 struct net_device_stats;
 struct sk_buff;
+struct kset;
 
 // Payload data packet structure
 struct mfhss_pkt_
@@ -43,6 +44,8 @@ struct mfhss_priv_ {
 	u8 *tx_pkt_data;
 	struct sk_buff *skb;
 	spinlock_t lock;
+	struct kset *static_regs;
+	struct kset *dynamic_regs;
 };
 
 

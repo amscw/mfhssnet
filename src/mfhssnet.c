@@ -7,6 +7,10 @@
 #include <linux/ip.h>			// struct iphdr
 #include <linux/tcp.h>			// struct tcphdr
 #include <linux/skbuff.h>
+#include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/of_address.h>
 
 #include "mfhssnet.h"
 #include "mfhssfs.h"
@@ -15,6 +19,23 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("amscw");			// https://github.com/amscw
+
+
+//-------------------------------------------------------------------------------------------------
+// MACRO
+//-------------------------------------------------------------------------------------------------
+#define PRINT_DSTR_STG(from) PDEBUG("%i:%s...\n", from, destroy_stage_strings[from]);
+
+//-------------------------------------------------------------------------------------------------
+// Types
+//-------------------------------------------------------------------------------------------------
+enum destroy_stage_ {
+	STAGE_DESTROY_ALL,
+	STAGE_UNREGISTER_NETDEV,
+	STAGE_DESTROY_DYNAMIC_REGS_DIR,
+	STAGE_DESTROY_STATIC_REGS_DIR,
+	STAGE_DESTROY_NETDEV,
+};
 
 //-------------------------------------------------------------------------------------------------
 // Prototypes
@@ -28,6 +49,9 @@ static int mfhss_change_mtu(struct net_device *dev, int new_mtu);
 static void mfhss_tx_timeout(struct net_device *dev);
 static struct net_device_stats *mfhss_stats(struct net_device *dev);
 static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned short type, const void *daddr, const void *saddr, unsigned len);
+static int mfhssnet_probe(struct platform_device *pl_dev);
+static int mfhssnet_remove(struct platform_device *pl_dev);
+
 
 //-------------------------------------------------------------------------------------------------
 // Varibles
@@ -50,6 +74,27 @@ static const struct header_ops mfhss_header_ops = {
 };
 static int timeout = DUMMY_NETDEV_TIMEOUT;
 static unsigned long trans_start;
+/* static */const struct of_device_id mfhssnet_of_match[] = {
+	{ .compatible = "xlnx,axi-modem-fhss-1.0", },
+	{}
+};
+MODULE_DEVICE_TABLE(of, mfhssnet_of_match);
+static struct platform_driver mfhssnet_driver = {
+		.driver = {
+			.name	= DRIVER_NAME,
+			.owner	= THIS_MODULE,
+			.of_match_table = of_match_ptr(mfhssnet_of_match),
+		},
+		.probe 		= mfhssnet_probe,
+		.remove		= mfhssnet_remove,
+};
+const char * const destroy_stage_strings[] = {
+	"destroying all",
+	"unregister netdev",
+	"destroying dynamic regs directory",
+	"destroying static regs directory",
+	"free netdev",
+};
 
 //-------------------------------------------------------------------------------------------------
 // Functions
@@ -209,17 +254,6 @@ static unsigned long trans_start;
 // 	return;
 // }
 
-static void mfhss_cleanup(void)
-{
-	if (mfhss_dev != NULL) 
-	{
-		// unregister_netdev(mfhss_dev);
-		pool_destroy();
-		free_netdev(mfhss_dev);
-		mfhss_dev = NULL;
-	}
-
-}
 
 // this callback called after allocation net_device structure
 static void mfhss_setup(struct net_device *dev)
@@ -257,21 +291,80 @@ static void mfhss_setup(struct net_device *dev)
 	
 	// rxIntEn(pDev, 1);	// enable receive interrupts
 	err = pool_create(dev, ETH_DATA_LEN);
-	pkt = pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	pool_get();
-	PDEBUG("now try put one: %li", pool_put(pkt));
-	pool_get();
-	pool_get();
-
 	PRINT_ERR(err);
 	
+}
+
+// FIXME: использовать стандартные механизмы ядра для работы со списками
+static inline void destroy_directory(struct kset *dir)
+{
+	struct list_head *next, *curr, *head;
+	struct kobject *kobj = NULL;
+
+	if (dir == NULL)
+		return;
+
+	// PDEBUG("destroying directory: %s\n", dir->kobj.name);
+
+	// если был добавлен хотя бы один объект
+	// TODO: вместо этого условия можем в цикле исправить инициализатор: pnext=pcurr
+	if (&dir->list != dir->list.next)
+	{
+		// удаление всех объектов множества
+		for (head = &dir->list, curr = head->next, next = 0; next != head;  curr = next)
+		{
+			next = curr->next;	// запоминаем указатель на следующий объект ДО уничтожения текущего
+			kobj = list_entry(curr, struct kobject, entry);
+			kobject_del(kobj);
+			kobject_put(kobj);
+		}
+	}
+	// удаление каталога верхнего уровня
+	kset_unregister(dir);
+}
+
+static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
+{
+	// dev != NULL because net device allocation the first thing of initialization
+	// we can use it safely
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+
+	switch (from)
+	{
+		case STAGE_DESTROY_ALL:
+			PRINT_DSTR_STG(STAGE_DESTROY_ALL);
+
+		case STAGE_UNREGISTER_NETDEV:
+			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
+
+		case STAGE_DESTROY_DYNAMIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_DYNAMIC_REGS_DIR);
+			destroy_directory(priv->dynamic_regs);
+
+		case STAGE_DESTROY_STATIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_STATIC_REGS_DIR);
+			destroy_directory(priv->static_regs);
+
+		case STAGE_DESTROY_NETDEV:
+			PRINT_DSTR_STG(STAGE_DESTROY_NETDEV);
+			if (mfhss_dev != NULL) 
+			{
+				free_netdev(mfhss_dev);
+				mfhss_dev = NULL;
+			}
+			break;
+		default:
+			mfhss_cleanup(STAGE_DESTROY_ALL, dev);
+	}
+
+
+	// if (mfhss_dev != NULL) 
+	// {
+	// 	// unregister_netdev(mfhss_dev);
+	// 	pool_destroy();
+	// 	free_netdev(mfhss_dev);
+	// 	mfhss_dev = NULL;
+	// }
 }
 	
 /*
@@ -424,14 +517,10 @@ static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned sh
 /*
  * Platform device support
  */
-
-
-/*
- * Entry/exit point functions
- */
-static __init int mfhss_init(void)
+static int mfhssnet_probe(struct platform_device *pl_dev)
 {
 	int err = 0;
+	struct mfhss_priv_ *priv;
 
 	// Allocate the device
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
@@ -442,9 +531,29 @@ static __init int mfhss_init(void)
 	if (mfhss_dev == NULL)
 	{
 		PRINT_ERR(err = -ENOMEM);
-		return -err;
-	} else PDEBUG("net device structure allocated at 0x%p (%ld bytes)", mfhss_dev, sizeof *mfhss_dev);
+		return err;
+	} 
+	priv = netdev_priv(mfhss_dev);
+	platform_set_drvdata(pl_dev, priv);	// or save mfhss_dev ?
 
+	// Create static registers directory in sysfs
+	priv->static_regs = kset_create_and_add("mfhss-static", NULL, NULL);
+	if (priv->static_regs == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_NETDEV, mfhss_dev);
+		return err;
+	}
+
+	// Create dynamic registers directory in sysfs
+	priv->dynamic_regs = kset_create_and_add("mfhss-dynamic", NULL, NULL);
+	if (priv->dynamic_regs == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_STATIC_REGS_DIR, mfhss_dev);
+		return err;
+	}
+	
 	// Register devices
 	// if ((err = register_netdev(mfhss_dev)) != 0)
 	// {
@@ -456,10 +565,25 @@ static __init int mfhss_init(void)
 	return err;
 }
 
+
+
+static int mfhssnet_remove (struct platform_device *pl_dev)
+{
+
+}
+
+/*
+ * Entry/exit point functions
+ */
+static __init int mfhss_init(void)
+{
+
+}
+
 static __exit void mfhss_exit(void)
 {	
-	mfhss_cleanup();
+	mfhss_cleanup(STAGE_DESTROY_ALL, mfhss_dev);
 }
 
 module_init(mfhss_init);
-module_exit(mfhss_cleanup);
+module_exit(mfhss_exit);
