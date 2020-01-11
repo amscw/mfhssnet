@@ -24,7 +24,7 @@ MODULE_AUTHOR("amscw");			// https://github.com/amscw
 //-------------------------------------------------------------------------------------------------
 // MACRO
 //-------------------------------------------------------------------------------------------------
-#define PRINT_DSTR_STG(from) PDEBUG("%i:%s...\n", from, destroy_stage_strings[from]);
+#define PRINT_DSTR_STG(from) PDEBUG("stage%i:%s...\n", from, destroy_stage_strings[from]);
 
 //-------------------------------------------------------------------------------------------------
 // Types
@@ -32,8 +32,12 @@ MODULE_AUTHOR("amscw");			// https://github.com/amscw
 enum destroy_stage_ {
 	STAGE_DESTROY_ALL,
 	STAGE_UNREGISTER_NETDEV,
+	STAGE_CLEAN_DYNAMIC_REGS_DIR,
 	STAGE_DESTROY_DYNAMIC_REGS_DIR,
+	STAGE_CLEAN_STATIC_REGS_DIR,
 	STAGE_DESTROY_STATIC_REGS_DIR,
+	STAGE_DESTROY_POOL,
+	STAGE_DESTROY_STATS,
 	STAGE_DESTROY_NETDEV,
 };
 
@@ -43,7 +47,7 @@ enum destroy_stage_ {
 static int mfhss_open(struct net_device *dev); 
 static int mfhss_close(struct net_device *dev);
 static int mfhss_config(struct net_device *dev, struct ifmap *map);
-// int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev);
+static int mfhss_tx_pkt(struct sk_buff *skb, struct net_device *dev);
 static int mfhss_ioctl(struct net_device *dev, struct ifreq *req, int cmd);
 static int mfhss_change_mtu(struct net_device *dev, int new_mtu);
 static void mfhss_tx_timeout(struct net_device *dev);
@@ -57,11 +61,10 @@ static int mfhssnet_remove(struct platform_device *pl_dev);
 // Varibles
 //-------------------------------------------------------------------------------------------------
 struct net_device *mfhss_dev;
-static void (*dummyNetdevInterrupt)(int, void *, struct pt_regs *);
 static const struct net_device_ops mfhss_net_device_ops = {
  	.ndo_open            = mfhss_open,
  	.ndo_stop            = mfhss_close,
-// 	.ndo_start_xmit      = dumTxPkt,
+ 	.ndo_start_xmit      = mfhss_tx_pkt,
  	.ndo_do_ioctl        = mfhss_ioctl,
  	.ndo_set_config      = mfhss_config,
  	.ndo_get_stats       = mfhss_stats,
@@ -91,8 +94,12 @@ static struct platform_driver mfhssnet_driver = {
 const char * const destroy_stage_strings[] = {
 	"destroying all",
 	"unregister netdev",
+	"clean dynamic regs directory",
 	"destroying dynamic regs directory",
+	"clean static regs directory",
 	"destroying static regs directory",
+	"destroying pool",
+	"destroying interface statistics",
 	"free netdev",
 };
 
@@ -102,11 +109,11 @@ const char * const destroy_stage_strings[] = {
 /*
  * Net device support
  */
-// static void rxIntEn(struct net_device *pDev, int bIsEnable)
-// {
-// 	struct dumPriv_ *pPriv = netdev_priv(pDev);
-// 	pPriv->bIsRxIntEnabled = bIsEnable;
-// }
+static void rx_int_en(struct net_device *dev, int enable)
+{
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+	priv->rx_int_en = enable;
+}
 
 // static void rxPkt(struct net_device *pDev, struct dumPacket_ *pPkt)
 // {
@@ -135,124 +142,118 @@ const char * const destroy_stage_strings[] = {
 // 	netif_rx(pSkB);
 // }
 
-// static void txPktByHW(char *pBuf, int len, struct net_device *pDev)
-// {
-// 	// This function deals with hw details. This interface loops back the packet to the other dummy interface (if any).
-// 	// In other words, this function implements the dummy-device behaviour, while all other procedures are rather device-independent
-// 	struct iphdr *pIP;
-// 	struct net_device *pDest;
-// 	struct dumPriv_ *pPriv;
-// 	u32 *pSAddr, *pDAddr;
-// 	struct dumPacket_ *pTxBuffer;
+static void regular_int_handler(int irq, void *devid, struct pt_regs *regs)
+{
+	int status_word;
+	struct mfhss_priv_ *priv;
+	struct mfhss_pkt_ *pkt = NULL;
+	
+	// As usual, check the "device" pointer to be sure it is really interrupting.
+	// Then assign "struct device *dev"
+	struct net_device *dev = (struct net_device *)devid;
+	// and check with hw if it's really ours 
+
+	// paranoid
+	if (dev == NULL)
+		return;
+
+	// Lock the device
+	priv = netdev_priv(dev);
+	spin_lock(&priv->lock);
+	// retrieve statusword: real netdevices use I/O instructions
+	status_word = priv->status;
+	// pPriv->status = 0;
+	// if (status_word & DUMMY_NETDEV_RX_INTR) {
+	// 	PDEBUG("rx interrupt occur at %s", pDev->name);
+	// 	// send it to rxPkt for handling 
+	// 	pPkt = dequeuePkt(pDev);
+	// 	if (pPkt) {
+	// 		PDEBUG("received new packet at %s, len %i", pDev->name, pPkt->datalen);
+	// 		rxPkt(pDev, pPkt);
+	// 	}
+	// }
+	if (status_word & DUMMY_NETDEV_TX_INTR) {
+		PDEBUG("tx interrupt occur at %s", dev->name);
+		// a transmission is over: free the skb
+		priv->stats->tx_packets++;
+		priv->stats->tx_bytes += priv->tx_pkt_len;
+		dev_kfree_skb(priv->skb);
+		priv->skb = NULL;
+		status_word &= ~DUMMY_NETDEV_TX_INTR;
+		priv->status = status_word;
+	}
+
+	// Unlock the device and we are done
+	spin_unlock(&priv->lock);
+	if (pkt) 
+		pool_put(pkt); // Do this outside the lock!
+	return;
+}
+
+static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
+{
+	// This function deals with hw details. This interface loops back the packet to the other dummy interface (if any).
+	// In other words, this function implements the dummy-device behaviour, while all other procedures are rather device-independent
+	struct iphdr *ip;
+	struct net_device *dest;
+	struct mfhss_priv_ *priv;
+	u32 *saddr, *daddr;
+	struct mfhss_pkt_ *tx_buffer;
     
-// 	// I am paranoid. Ain't I?
-// 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr))
-// 	{
-// 		PRINT_STATUS_MSG("packet too short (%i octets)", -1, len);
-// 		return;
-// 	}
+	// I am paranoid. Ain't I?
+	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr))
+	{
+		PERR("packet too short (%i octets)", len);
+		return;
+	}
 
 	
-// 	// Ethhdr is 14 bytes, but the kernel arranges for iphdr
-// 	pIP = (struct iphdr *)(pBuf + sizeof(struct ethhdr));
-// 	pSAddr = &pIP->saddr;
-// 	pDAddr = &pIP->daddr;
+	// Ethhdr is 14 bytes, but the kernel arranges for iphdr
+	ip = (struct iphdr *)(buf + sizeof(struct ethhdr));
+	saddr = &ip->saddr;
+	daddr = &ip->daddr;
 
-// 	((u8 *)pSAddr)[2] ^= 1; // change the third octet (class C)
-// 	((u8 *)pDAddr)[2] ^= 1;
+	((u8 *)saddr)[2] ^= 1; // change the third octet (class C)
+	((u8 *)daddr)[2] ^= 1;
 
-// 	pIP->check = 0;         // and rebuild the checksum (ip needs it)
-// 	pIP->check = ip_fast_csum((unsigned char *)pIP, pIP->ihl);
+	ip->check = 0;         // and rebuild the checksum (ip needs it)
+	ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
 
-// 	if (pDev == dummyDevs[0])
-// 		PDEBUG("%08x:%05i --> %08x:%05i\n",
-// 				ntohl(pIP->saddr), ntohs(((struct tcphdr *)(pIP+1))->source),
-// 				ntohl(pIP->daddr), ntohs(((struct tcphdr *)(pIP+1))->dest));
-// 	else
-// 		PDEBUG("%08x:%05i <-- %08x:%05i\n",
-// 				ntohl(pIP->daddr), ntohs(((struct tcphdr *)(pIP+1))->dest),
-// 				ntohl(pIP->saddr), ntohs(((struct tcphdr *)(pIP+1))->source));
-
+	PDEBUG("%08x:%05i --> %08x:%05i\n",
+			ntohl(ip->saddr), ntohs(((struct tcphdr *)(ip+1))->source),
+			ntohl(ip->daddr), ntohs(((struct tcphdr *)(ip+1))->dest));
 	
-// 	// Ok, now the packet is ready for transmission: first simulate a receive interrupt 
-// 	// on the twin device, then a transmission-done on the transmitting device
-// 	pDest = dummyDevs[pDev == dummyDevs[0] ? 1 : 0];
-// 	pPriv = netdev_priv(pDest);
-// 	pTxBuffer = getPkt(pDev);
-// 	if (pTxBuffer != NULL)
-// 	{
-// 		int i;
+	
+	// Ok, now the packet is ready for transmission: first simulate a receive interrupt 
+	// on the twin device, then a transmission-done on the transmitting device
+	// pDest = dummyDevs[pDev == dummyDevs[0] ? 1 : 0];
+	// pPriv = netdev_priv(pDest);
+	tx_buffer = pool_get();
+	if (tx_buffer != NULL)
+	{
+		tx_buffer->datalen = len;
+	 	// fake transmit packet
+		memcpy(tx_buffer->data, buf, len);
+		PDEBUG("hw tx packet by %s, len is %i", dev->name, len);
 		
-// 		pTxBuffer->datalen = len;
-// 	 	// fake transmit packet
-// 		memcpy(pTxBuffer->data, pBuf, len);
-// 		PDEBUG("hw tx packet by %s, len is %i", pDev->name, len);
-		
-// 	  	// fake receive packet
-// 		enqueuePkt(pDest, pTxBuffer);	
-// 		if (pPriv->bIsRxIntEnabled) 
-// 		{
-// 			pPriv->status |= DUMMY_NETDEV_RX_INTR;
-// 		 	dummyNetdevInterrupt(0, pDest, NULL);
-// 		}
+	  	// fake receive packet
+		// enqueuePkt(pDest, pTxBuffer);	
+		// if (pPriv->bIsRxIntEnabled) 
+		// {
+		// 	pPriv->status |= DUMMY_NETDEV_RX_INTR;
+		//  	dummyNetdevInterrupt(0, pDest, NULL);
+		// }
 
-// 		// terminate transmission
-// 		pPriv = netdev_priv(pDev);
-// 		pPriv->txPacketLen = len;
-// 		pPriv->pTxPacketData = pBuf;
-// 		pPriv->status |= DUMMY_NETDEV_TX_INTR;
-// 		dummyNetdevInterrupt(0, pDev, NULL);
-// 	}
-// }
+		// terminate transmission
+		priv = netdev_priv(dev);
+		priv->tx_pkt_len = len;
+		priv->tx_pkt_data = buf;
+		priv->status |= DUMMY_NETDEV_TX_INTR;
+		regular_int_handler(0, dev, NULL);
+	}
+}
 
 
-// static void regularIntHandler(int irq, void *pDevId, struct pt_regs *pRegs)
-// {
-// 	int statusWord;
-// 	struct dumPriv_ *pPriv;
-// 	struct dumPacket_ *pPkt = NULL;
-	
-// 	// As usual, check the "device" pointer to be sure it is really interrupting.
-// 	// Then assign "struct device *dev"
-// 	struct net_device *pDev = (struct net_device *)pDevId;
-// 	// and check with hw if it's really ours 
-
-// 	// paranoid
-// 	if (pDev == NULL)
-// 		return;
-
-// 	// Lock the device
-// 	pPriv = netdev_priv(pDev);
-// 	spin_lock(&pPriv->lock);
-// 	// retrieve statusword: real netdevices use I/O instructions
-// 	statusWord = pPriv->status;
-// 	// pPriv->status = 0;
-// 	if (statusWord & DUMMY_NETDEV_RX_INTR) {
-// 		PDEBUG("rx interrupt occur at %s", pDev->name);
-// 		// send it to rxPkt for handling 
-// 		pPkt = dequeuePkt(pDev);
-// 		if (pPkt) {
-// 			PDEBUG("received new packet at %s, len %i", pDev->name, pPkt->datalen);
-// 			rxPkt(pDev, pPkt);
-// 		}
-// 	}
-// 	if (statusWord & DUMMY_NETDEV_TX_INTR) {
-// 		PDEBUG("tx interrupt occur at %s", pDev->name);
-// 		// a transmission is over: free the skb
-// 		pPriv->stats.tx_packets++;
-// 		pPriv->stats.tx_bytes += pPriv->txPacketLen;
-// 		dev_kfree_skb(pPriv->pSkB);
-// 		pPriv->pSkB = NULL;
-// 		statusWord &= ~DUMMY_NETDEV_TX_INTR;
-// 		pPriv->status = statusWord;
-// 	}
-
-// 	// Unlock the device and we are done
-// 	spin_unlock(&pPriv->lock);
-// 	if (pPkt) 
-// 		freePkt(pPkt); // Do this outside the lock!
-// 	return;
-// }
 
 
 // this callback called after allocation net_device structure
@@ -262,7 +263,6 @@ static void mfhss_setup(struct net_device *dev)
 	// The init function (sometimes called probe).
 	// It is invoked by register_netdev()
 	struct mfhss_priv_ *priv = netdev_priv(dev);
-	struct mfhss_pkt_ *pkt;
 
 	// Then, initialize the priv field. This encloses the statistics and a few private fields.
 
@@ -289,83 +289,13 @@ static void mfhss_setup(struct net_device *dev)
 	dev->netdev_ops = &mfhss_net_device_ops;
 	dev->header_ops = &mfhss_header_ops;
 	
-	// rxIntEn(pDev, 1);	// enable receive interrupts
+	rx_int_en(dev, 1);	// enable receive interrupts
 	err = pool_create(dev, ETH_DATA_LEN);
 	PRINT_ERR(err);
 	
 }
 
-// FIXME: использовать стандартные механизмы ядра для работы со списками
-static inline void destroy_directory(struct kset *dir)
-{
-	struct list_head *next, *curr, *head;
-	struct kobject *kobj = NULL;
-
-	if (dir == NULL)
-		return;
-
-	// PDEBUG("destroying directory: %s\n", dir->kobj.name);
-
-	// если был добавлен хотя бы один объект
-	// TODO: вместо этого условия можем в цикле исправить инициализатор: pnext=pcurr
-	if (&dir->list != dir->list.next)
-	{
-		// удаление всех объектов множества
-		for (head = &dir->list, curr = head->next, next = 0; next != head;  curr = next)
-		{
-			next = curr->next;	// запоминаем указатель на следующий объект ДО уничтожения текущего
-			kobj = list_entry(curr, struct kobject, entry);
-			kobject_del(kobj);
-			kobject_put(kobj);
-		}
-	}
-	// удаление каталога верхнего уровня
-	kset_unregister(dir);
-}
-
-static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
-{
-	// dev != NULL because net device allocation the first thing of initialization
-	// we can use it safely
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-
-	switch (from)
-	{
-		case STAGE_DESTROY_ALL:
-			PRINT_DSTR_STG(STAGE_DESTROY_ALL);
-
-		case STAGE_UNREGISTER_NETDEV:
-			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
-
-		case STAGE_DESTROY_DYNAMIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_DESTROY_DYNAMIC_REGS_DIR);
-			destroy_directory(priv->dynamic_regs);
-
-		case STAGE_DESTROY_STATIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_DESTROY_STATIC_REGS_DIR);
-			destroy_directory(priv->static_regs);
-
-		case STAGE_DESTROY_NETDEV:
-			PRINT_DSTR_STG(STAGE_DESTROY_NETDEV);
-			if (mfhss_dev != NULL) 
-			{
-				free_netdev(mfhss_dev);
-				mfhss_dev = NULL;
-			}
-			break;
-		default:
-			mfhss_cleanup(STAGE_DESTROY_ALL, dev);
-	}
-
-
-	// if (mfhss_dev != NULL) 
-	// {
-	// 	// unregister_netdev(mfhss_dev);
-	// 	pool_destroy();
-	// 	free_netdev(mfhss_dev);
-	// 	mfhss_dev = NULL;
-	// }
-}
+// mfhss_cleanup 
 	
 /*
  * Net device operations
@@ -424,34 +354,133 @@ static int mfhss_config(struct net_device *dev, struct ifmap *map)
 	return err;
 }
 
-// int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
-// {
-// 	int len;
-// 	char *pData, shortpkt[ETH_ZLEN];
-// 	struct dumPriv_ *pPriv = netdev_priv(pDev);
+static int mfhss_tx_pkt(struct sk_buff *skb, struct net_device *dev)
+{
+	int len;
+	char *data, shortpkt[ETH_ZLEN];
+	struct mfhss_priv_ *priv = netdev_priv(dev);
 	
-// 	pData = pSkB->data;
-// 	len = pSkB->len;
-// 	if (len < ETH_ZLEN) {
-// 		memset(shortpkt, 0, ETH_ZLEN);
-// 		memcpy(shortpkt, pSkB->data, pSkB->len);
-// 		len = ETH_ZLEN;
-// 		pData = shortpkt;
-// 	}
-// 	transStart = jiffies; 	// save the timestamp
-// 	pPriv->pSkB = pSkB;				// Remember the skb, so we can free it at interrupt time
+	data = skb->data;
+	len = skb->len;
+	if (len < ETH_ZLEN) {
+		memset(shortpkt, 0, ETH_ZLEN);
+		memcpy(shortpkt, skb->data, skb->len);
+		len = ETH_ZLEN;
+		data = shortpkt;
+	}
+	trans_start = jiffies; 	// save the timestamp
+	priv->skb = skb;				// Remember the skb, so we can free it at interrupt time
 
-// 	// actual deliver of data is device-specific, and not shown here
-// 	txPktByHW(pData, len, pDev);
+	// actual deliver of data is device-specific, and not shown here
+	tx_pkt_by_hw(data, len, dev);
 
-// 	return NETDEV_TX_OK;
-// }
+	return NETDEV_TX_OK;
+}
 
 static int mfhss_ioctl(struct net_device *dev, struct ifreq *req, int cmd)
 {
-	// PRINT_STATUS_MSG("command 0x%04x not implemeted for %s", 0, cmd, pDev->name);
-	return 0;
+	int err = 0;
+
+	return err;
 }
+// static long mfhssdrv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+// {
+// 	int res = 0;
+// 	mfhssdrv_private *charpriv = filp->private_data;
+// 	struct reg_group *g;
+// 	MFHSS_REG_TypeDef reg_descr;
+// 	MFHSS_GROUP_TypeDef group_descr;
+// 	struct list_head *p;
+// 	struct kobject *k;
+// 	struct reg_attribute *a;
+
+// 	// PINFO("In char driver ioctl() function\n");
+
+// 	// validate type
+// 	if (_IOC_TYPE(cmd) != MFHSSDRV_IOC_MAGIC)
+// 		return -ENOTTY;
+// 	// validate number
+// 	if (_IOC_NR(cmd) > MFHSSDRV_IOC_MAXNR)
+// 		return -ENOTTY;
+// 	// validate access
+// 	if (_IOC_DIR(cmd) & _IOC_READ)
+// 		res = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+// 	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+// 		res = !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+// 	if (res)
+// 		return -EFAULT;
+
+// 	// can process
+// 	switch (cmd)
+// 	{
+// 	case MFHSSDRV_IORESET:
+// 		PDEBUG("Performing reset\n");
+// 		// TODO: MFHSSDRV_IORESET not implemented
+// 		break;
+
+// 	case MFHSSDRV_IOMAKEGROUP:
+// 		// забираем описание группы
+// 		copy_from_user(&group_descr, (const void __user *)arg, sizeof group_descr);
+// 		// выделяем память под новый объект
+// 		g = kzalloc(sizeof *g, GFP_KERNEL);
+// 		if (!g)
+// 		{
+// 			PERR("Failed to alloc group object %s\n", group_descr.nodeName);
+// 			return -ENOMEM;
+// 		}
+// 		// настраиваем его и регистрируем
+// 		kobject_init(&g->kobj, &reg_type);
+// 		g->kobj.kset = charpriv->dynamic_regs;
+// 		g->charpriv = charpriv;
+// 		res = kobject_add(&g->kobj, &charpriv->dynamic_regs->kobj, "%s", group_descr.nodeName);	// будем надеяться, что name будет скопирован.
+// 		if (res != 0)
+// 		{
+// 			PERR("Failed to register group object %s\n", group_descr.nodeName);
+// 			kobject_put(&g->kobj); // будет вызван release, который удалит reg
+// 			return -ENOMEM;
+// 		}
+// 		PDEBUG("New group added successfully (%s)\n", group_descr.nodeName);
+// 		break;
+
+// 	case MFHSSDRV_IOMAKEREG:
+// 		// забираем описание регистра из пространства пользователя
+// 		copy_from_user(&reg_descr, (const void __user *)arg, sizeof reg_descr);
+// 		// поиск указанной группы
+// 		list_for_each(p, &charpriv->dynamic_regs->list) {
+// 			k = list_entry(p, struct kobject, entry);
+// 			if (!strcmp(k->name, reg_descr.targetNode))
+// 			{
+// 				a = kzalloc (sizeof *a, GFP_KERNEL);
+// 				if (!a)
+// 				{
+// 					PERR("Failed to allocate attribute %s\n", reg_descr.regName);
+// 					return -ENOMEM;
+// 				}
+// 				a->address = reg_descr.address;
+// 				strcpy(a->name, reg_descr.regName);
+// 				a->default_attribute.name = a->name;
+// 				a->default_attribute.mode = S_IRUGO | S_IWUSR;
+// 				res = sysfs_create_file(k, &a->default_attribute);
+// 				if (res != 0)
+// 				{
+// 					PERR("Failed to register attribute %s\n", reg_descr.regName);
+// 					kfree(a);
+// 					return -ENOMEM;
+// 				}
+// 				PDEBUG("New attribute %s added to group %s\n", reg_descr.regName, reg_descr.targetNode);
+// 				break;
+// 			}
+// 		}
+// 		break;
+
+// 	default:
+// 		PERR("unsupported command: 0x%x\n", cmd);
+// 		return -ENOTTY;
+// 	}
+
+// 	return 0;
+// }
+
 
 static int mfhss_change_mtu(struct net_device *dev, int new_mtu)
 {
@@ -483,11 +512,11 @@ static void mfhss_tx_timeout (struct net_device *dev)
 {
 	struct mfhss_priv_ *priv = netdev_priv(dev);
 
-	// PDEBUG("Transmit timeout at %ld, latency %ld\n", jiffies, jiffies - trans_start);
+	PDEBUG("Transmit timeout at %ld, latency %ld\n", jiffies, jiffies - trans_start);
     
     // Simulate a transmission interrupt to get things moving
-	// priv->status = DUMMY_NETDEV_TX_INTR;
-	// dummyNetdevInterrupt(0, pDev, NULL);
+	priv->status = DUMMY_NETDEV_TX_INTR;
+	regular_int_handler(0, dev, NULL);
 	priv->stats->tx_errors++;
 	netif_wake_queue(dev);
 	return;
@@ -517,8 +546,94 @@ static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned sh
 /*
  * Platform device support
  */
+static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
+{
+	// dev != NULL because net device allocation the first thing of initialization
+	// we can use it safely
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+
+	switch (from)
+	{
+		case STAGE_DESTROY_ALL:
+			PRINT_DSTR_STG(STAGE_DESTROY_ALL);
+
+		case STAGE_UNREGISTER_NETDEV:
+			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
+			unregister_netdev(dev);
+
+		case STAGE_CLEAN_DYNAMIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_CLEAN_DYNAMIC_REGS_DIR);
+			clean_dir(priv->dynamic_regs);
+
+		case STAGE_DESTROY_DYNAMIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_DYNAMIC_REGS_DIR);
+			kset_unregister(priv->dynamic_regs);
+			priv->dynamic_regs = NULL;
+
+		case STAGE_CLEAN_STATIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_CLEAN_STATIC_REGS_DIR);
+			clean_dir(priv->static_regs);
+
+		case STAGE_DESTROY_STATIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_STATIC_REGS_DIR);
+			kset_unregister(priv->static_regs);
+			priv->static_regs = NULL;
+
+		case STAGE_DESTROY_POOL:
+			PRINT_DSTR_STG(STAGE_DESTROY_POOL);
+			pool_destroy();
+
+		case STAGE_DESTROY_STATS:
+			PRINT_DSTR_STG(STAGE_DESTROY_STATS);
+			if (priv->stats != NULL)
+			{
+				kfree(priv->stats);
+				priv->stats = NULL;
+			}
+
+		case STAGE_DESTROY_NETDEV:
+			PRINT_DSTR_STG(STAGE_DESTROY_NETDEV);
+			if (mfhss_dev != NULL) 
+			{
+				free_netdev(mfhss_dev);
+				mfhss_dev = NULL;
+			}
+			break;
+		default:
+			mfhss_cleanup(STAGE_DESTROY_ALL, dev);
+	}
+
+
+	// if (mfhss_dev != NULL) 
+	// {
+	// 	// unregister_netdev(mfhss_dev);
+	// 	pool_destroy();
+	// 	free_netdev(mfhss_dev);
+	// 	mfhss_dev = NULL;
+	// }
+}
 static int mfhssnet_probe(struct platform_device *pl_dev)
 {
+	return -1;
+}
+
+static int mfhssnet_remove (struct platform_device *pl_dev)
+{
+	return 0;
+}
+
+/*
+ * Entry/exit point functions
+ */
+static __init int mfhss_init(void)
+{
+	// int err = 0;
+
+	// err = platform_driver_register(&mfhssnet_driver);
+	// PRINT_ERR(err);
+	// return err;
+
+
 	int err = 0;
 	struct mfhss_priv_ *priv;
 
@@ -534,14 +649,52 @@ static int mfhssnet_probe(struct platform_device *pl_dev)
 		return err;
 	} 
 	priv = netdev_priv(mfhss_dev);
-	platform_set_drvdata(pl_dev, priv);	// or save mfhss_dev ?
+	
+	// Allocate interface stats
+	priv->stats = kzalloc(sizeof *(priv->stats), GFP_KERNEL);
+	if (priv == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_NETDEV, mfhss_dev);
+		return err;
+	}
+
+	// Allocate pool
+	err = pool_create(mfhss_dev, ETH_DATA_LEN);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		mfhss_cleanup(STAGE_DESTROY_STATS, mfhss_dev);
+		return err;
+	}
+
+	// Allocation private data ok, now save it
+	// platform_set_drvdata(pl_dev, priv);	// or save mfhss_dev ?
 
 	// Create static registers directory in sysfs
 	priv->static_regs = kset_create_and_add("mfhss-static", NULL, NULL);
 	if (priv->static_regs == NULL)
 	{
 		PRINT_ERR(err = -ENOMEM);
-		mfhss_cleanup(STAGE_DESTROY_NETDEV, mfhss_dev);
+		mfhss_cleanup(STAGE_DESTROY_POOL, mfhss_dev);
+		return err;
+	}
+	
+	// Create static registers subdirectories and files
+	err = create_dma_subdir(priv->static_regs, priv);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		// ниодной поддиректории не было создано, так что просто сносим каталог
+		mfhss_cleanup(STAGE_DESTROY_STATIC_REGS_DIR, mfhss_dev);
+		return err;
+	}
+	err = create_mlip_subdir(priv->static_regs, priv);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		// если была создана хотя бы одна поддиректория, нужно вызывать очистку каталога, и только потом его снос
+		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, mfhss_dev);
 		return err;
 	}
 
@@ -550,34 +703,20 @@ static int mfhssnet_probe(struct platform_device *pl_dev)
 	if (priv->dynamic_regs == NULL)
 	{
 		PRINT_ERR(err = -ENOMEM);
-		mfhss_cleanup(STAGE_DESTROY_STATIC_REGS_DIR, mfhss_dev);
+		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, mfhss_dev);
 		return err;
 	}
-	
+	// all subdirectories will be create dinamically
+
 	// Register devices
-	// if ((err = register_netdev(mfhss_dev)) != 0)
-	// {
-	// 	PRINT_ERR(err);
-	// 	mfhss_cleanup();
-	// 	return -err;
-	// } else PDEBUG("%s successfully registered!", mfhss_dev->name);
+	if ((err = register_netdev(mfhss_dev)) != 0)
+	{
+		PRINT_ERR(err);
+		mfhss_cleanup(STAGE_CLEAN_DYNAMIC_REGS_DIR, mfhss_dev);
+		return err;
+	} else PDEBUG("%s successfully registered!", mfhss_dev->name);
 	PRINT_ERR(err);
 	return err;
-}
-
-
-
-static int mfhssnet_remove (struct platform_device *pl_dev)
-{
-
-}
-
-/*
- * Entry/exit point functions
- */
-static __init int mfhss_init(void)
-{
-
 }
 
 static __exit void mfhss_exit(void)
