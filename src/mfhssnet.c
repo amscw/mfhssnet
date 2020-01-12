@@ -11,6 +11,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_address.h>
+#include <linux/dma-mapping.h>
 
 #include "mfhssnet.h"
 #include "mfhssfs.h"
@@ -24,9 +25,12 @@ MODULE_AUTHOR("amscw");			// https://github.com/amscw
 //-------------------------------------------------------------------------------------------------
 // MACRO
 //-------------------------------------------------------------------------------------------------
+#define MFHSSNET_DMA_SIZE	2048
 #define PRINT_DSTR_STG(from) PDEBUG("stage%i:%s...\n", from, destroy_stage_strings[from])
-#define REG_WR(p, a, v) iowrite32(v, (void __iomem *)(p->io_base + a)) 
-#define REG_RD(p, a) ioread32((void __iomem *)(p->io_base + a))
+#define PRINT_CLOSE_STG(from) PDEBUG("stage%i:%s...\n", from, close_stage_strings[from])
+// WARNING: требуется контекст с priv
+#define REG_WR(dir, reg, value) iowrite32(value, (void __iomem*)(priv->io_base + REG_##dir##_##reg##_ADDRESS))
+#define REG_RD(dir, reg) ioread32((void __iomem*)(priv->io_base + REG_##dir##_##reg##_ADDRESS))
 
 //-------------------------------------------------------------------------------------------------
 // Types
@@ -43,6 +47,15 @@ enum destroy_stage_ {
 	STAGE_DESTROY_POOL,
 	STAGE_DESTROY_STATS,
 	STAGE_DESTROY_NETDEV,
+};
+
+enum close_stage_
+{
+	STAGE_FREE_ALL,
+	STAGE_FREE_DMA_SRC,
+	STAGE_FREE_DMA_DST,
+	STAGE_UNREG_IRQ_RX,
+	STAGE_UNREG_IRQ_TX,
 };
 
 //-------------------------------------------------------------------------------------------------
@@ -109,6 +122,14 @@ static const char * const destroy_stage_strings[] = {
 	"free netdev",
 };
 
+static const char* const close_stage_strings[] = {
+	"free all",
+	"free DMA source memory",
+	"free DMA destination memory",
+	"unregister RX interrupt handler",
+	"unregister TX interrupt handler",
+};
+
 //-------------------------------------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------------------------------------
@@ -167,7 +188,12 @@ static void rx_int_en(struct net_device *dev, int enable)
 // 	netif_rx(pSkB);
 // }
 
-static void regular_int_handler(int irq, void *devid, struct pt_regs *regs)
+static irqreturn_t irq_rx_handler(int irq, void *devid)
+{
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t irq_tx_handler(int irq, void *devid)
 {
 	int status_word;
 	struct mfhss_priv_ *priv;
@@ -180,7 +206,7 @@ static void regular_int_handler(int irq, void *devid, struct pt_regs *regs)
 
 	// paranoid
 	if (dev == NULL)
-		return;
+		return IRQ_NONE;
 
 	// Lock the device
 	priv = netdev_priv(dev);
@@ -212,7 +238,7 @@ static void regular_int_handler(int irq, void *devid, struct pt_regs *regs)
 	spin_unlock(&priv->lock);
 	if (pkt) 
 		pool_put(pkt); // Do this outside the lock!
-	return;
+	return IRQ_HANDLED;
 }
 
 static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
@@ -220,7 +246,6 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 	// This function deals with hw details. This interface loops back the packet to the other dummy interface (if any).
 	// In other words, this function implements the dummy-device behaviour, while all other procedures are rather device-independent
 	struct iphdr *ip;
-	struct net_device *dest;
 	struct mfhss_priv_ *priv;
 	u32 *saddr, *daddr;
 	struct mfhss_pkt_ *tx_buffer;
@@ -246,10 +271,7 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 	PDEBUG("%s:%05i --> %s:%05i",
 		ipaddr_to_str(ip->saddr),ntohs(((struct tcphdr *)(ip+1))->source),
 		ipaddr_to_str(ip->daddr),ntohs(((struct tcphdr *)(ip+1))->dest));
-	// PDEBUG("%08x:%05i --> %08x:%05i\n",
-	// 		ntohl(ip->saddr), ntohs(((struct tcphdr *)(ip+1))->source),
-	// 		ntohl(ip->daddr), ntohs(((struct tcphdr *)(ip+1))->dest));
-	
+			
 	// Ok, now the packet is ready for transmission: first simulate a receive interrupt 
 	// on the twin device, then a transmission-done on the transmitting device
 	// pDest = dummyDevs[pDev == dummyDevs[0] ? 1 : 0];
@@ -275,7 +297,7 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 		priv->tx_pkt_len = len;
 		priv->tx_pkt_data = buf;
 		priv->status |= DUMMY_NETDEV_TX_INTR;
-		regular_int_handler(0, dev, NULL);
+		// regular_int_handler(0, dev, NULL);
 		pool_put(tx_buffer);
 	}
 }
@@ -317,22 +339,168 @@ static void mfhss_setup(struct net_device *dev)
 	PRINT_ERR(err);	
 }
 
-// mfhss_cleanup 
+static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
+{
+	// dev != NULL because net device allocation the first thing of initialization
+	// we can use it safely
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+
+	switch (from)
+	{
+		case STAGE_DESTROY_ALL:
+			PRINT_DSTR_STG(STAGE_DESTROY_ALL);
+
+		case STAGE_UNREGISTER_NETDEV:
+			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
+			unregister_netdev(dev);
+
+		case STAGE_UNMAP_MEM_REGION:
+			iounmap(priv->io_base);
+
+		case STAGE_DESTROY_MEM_REGION:
+			PRINT_DSTR_STG(STAGE_DESTROY_MEM_REGION);
+			release_mem_region(priv->resource.start, resource_size(&priv->resource));
+
+		case STAGE_CLEAN_DYNAMIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_CLEAN_DYNAMIC_REGS_DIR);
+			clean_dir(priv->dynamic_regs);
+
+		case STAGE_DESTROY_DYNAMIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_DYNAMIC_REGS_DIR);
+			kset_unregister(priv->dynamic_regs);
+			priv->dynamic_regs = NULL;
+
+		case STAGE_CLEAN_STATIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_CLEAN_STATIC_REGS_DIR);
+			clean_dir(priv->static_regs);
+
+		case STAGE_DESTROY_STATIC_REGS_DIR:
+			PRINT_DSTR_STG(STAGE_DESTROY_STATIC_REGS_DIR);
+			kset_unregister(priv->static_regs);
+			priv->static_regs = NULL;
+
+		case STAGE_DESTROY_POOL:
+			PRINT_DSTR_STG(STAGE_DESTROY_POOL);
+			pool_destroy();
+
+		case STAGE_DESTROY_STATS:
+			PRINT_DSTR_STG(STAGE_DESTROY_STATS);
+			if (priv->stats != NULL)
+			{
+				kfree(priv->stats);
+				priv->stats = NULL;
+			}
+
+		case STAGE_DESTROY_NETDEV:
+			PRINT_DSTR_STG(STAGE_DESTROY_NETDEV);
+			if (mfhss_dev != NULL) 
+			{
+				free_netdev(mfhss_dev);
+				mfhss_dev = NULL;
+			}
+			break;
+		default:
+			mfhss_cleanup(STAGE_DESTROY_ALL, dev);
+	}
+}
+
+static void mfhss_close_from(enum close_stage_ from, struct net_device *dev)
+{
+	struct mfhss_priv_ *priv;
+
+	if (dev == NULL) 
+	{
+		PRINT_ERR(-EFAULT);
+		return;
+	}
+	priv = netdev_priv(dev);
+
+	switch(from)
+	{
+		case STAGE_FREE_ALL:
+			PRINT_CLOSE_STG(STAGE_FREE_ALL);
+
+		case STAGE_UNREG_IRQ_TX:
+			PRINT_CLOSE_STG(STAGE_UNREG_IRQ_TX);
+			free_irq(priv->irq_tx, dev);
+
+		case STAGE_UNREG_IRQ_RX:
+			PRINT_CLOSE_STG(STAGE_UNREG_IRQ_RX);
+			free_irq(priv->irq_rx, dev);
+
+		case STAGE_FREE_DMA_DST:
+			PRINT_CLOSE_STG(STAGE_FREE_DMA_DST);
+			dma_free_coherent(NULL, MFHSSNET_DMA_SIZE, priv->dst_addr, priv->dst_handle);
+
+		case STAGE_FREE_DMA_SRC:
+			PRINT_CLOSE_STG(STAGE_FREE_DMA_SRC);
+			dma_free_coherent(NULL, MFHSSNET_DMA_SIZE, priv->src_addr, priv->src_handle);
+
+		default:
+			mfhss_close_from(STAGE_FREE_ALL, dev);
+	}
+}
 	
 /*
  * Net device operations
  */
-
 static int mfhss_open(struct net_device *dev) 
 {
 	int err = 0;
-	// request_region(), request_irq(), ...
+	unsigned long flags = 0;
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+
+	// request DMA memories
+	priv->src_addr = dma_alloc_coherent(NULL, MFHSSNET_DMA_SIZE, &priv->src_handle, GFP_KERNEL);
+	if (priv->src_addr == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		return err;
+	}
+
+	priv->dst_addr = dma_alloc_coherent(NULL, MFHSSNET_DMA_SIZE, &priv->dst_handle, GFP_KERNEL);
+	if (priv->dst_addr == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_close_from(STAGE_FREE_DMA_SRC, dev);
+		return err;
+	}
+
+	// register interrupt handlers
+	err = request_irq(priv->irq_rx, irq_rx_handler, IRQF_SHARED, DRIVER_NAME, dev);
+	if (err != 0)
+	{
+		PRINT_ERR (err);
+		mfhss_close_from(STAGE_FREE_DMA_DST, dev);
+		return err;
+	}
+
+	err = request_irq(priv->irq_tx, irq_tx_handler, IRQF_SHARED, DRIVER_NAME, dev);
+	if (err != 0)
+	{
+		PRINT_ERR (err);
+		mfhss_close_from(STAGE_UNREG_IRQ_RX, dev);
+		return err;
+	}
+
+	// start the device
+	spin_lock_irqsave(&priv->lock, flags);
+	REG_WR(DMA, SA, priv->src_handle);
+	REG_WR(DMA, DA, priv->dst_handle);
+	REG_WR(MLIP, RST, 1);
+	REG_WR(MLIP, RST, 0);
+	REG_WR(MLIP, IR, 1);
+	REG_WR(DMA, IR, 1);
+	REG_WR(MLIP, CE, 1);
+	spin_unlock_irqrestore(&priv->lock, flags);
 
 	// Assign the hardware address
 	memcpy(dev->dev_addr, "\0FHSS0", ETH_ALEN);
 	PDEBUG("MAC address %02x:%02x:%02x:%02x:%02x:%02x assigned to %s", 
 		dev->dev_addr[0], dev->dev_addr[1], dev->dev_addr[2], dev->dev_addr[3], dev->dev_addr[4], dev->dev_addr[5],
 		dev->name);
+
+	// start xmit
 	netif_start_queue(dev);
 	PRINT_ERR(err);
 	return err;
@@ -340,10 +508,25 @@ static int mfhss_open(struct net_device *dev)
 
 static int mfhss_close(struct net_device *dev)
 {
-	// release ports, irq and such...
+	int err = 0;
+	unsigned long flags = 0;
+	struct mfhss_priv_ *priv = netdev_priv(dev);
 
+	// запретить передачу
 	netif_stop_queue(dev);
-	return 0;	
+
+	// выключить устройство
+	spin_lock_irqsave(&priv->lock, flags);
+	REG_WR(MLIP, CE, 0);
+	REG_WR(DMA, IR, 0);
+	REG_WR(MLIP, IR, 0);
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	// освободить память
+	mfhss_close_from(STAGE_FREE_ALL, dev);
+	
+	PRINT_ERR(err);
+	return err;	
 }
 
 static int mfhss_config(struct net_device *dev, struct ifmap *map)
@@ -493,7 +676,7 @@ static void mfhss_tx_timeout (struct net_device *dev)
     
     // Simulate a transmission interrupt to get things moving
 	priv->status = DUMMY_NETDEV_TX_INTR;
-	regular_int_handler(0, dev, NULL);
+	// regular_int_handler(0, dev, NULL);
 	priv->stats->tx_errors++;
 	netif_wake_queue(dev);
 	return;
@@ -523,79 +706,6 @@ static int mfhss_header(struct sk_buff *skb, struct net_device *dev, unsigned sh
 /*
  * Platform device support
  */
-static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
-{
-	// dev != NULL because net device allocation the first thing of initialization
-	// we can use it safely
-	struct mfhss_priv_ *priv = netdev_priv(dev);
-
-	switch (from)
-	{
-		case STAGE_DESTROY_ALL:
-			PRINT_DSTR_STG(STAGE_DESTROY_ALL);
-
-		case STAGE_UNREGISTER_NETDEV:
-			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
-			unregister_netdev(dev);
-
-		case STAGE_UNMAP_MEM_REGION:
-			iounmap(priv->io_base);
-
-		case STAGE_DESTROY_MEM_REGION:
-			PRINT_DSTR_STG(STAGE_DESTROY_MEM_REGION);
-			release_mem_region(priv->resource.start, resource_size(&priv->resource));
-
-		case STAGE_CLEAN_DYNAMIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_CLEAN_DYNAMIC_REGS_DIR);
-			clean_dir(priv->dynamic_regs);
-
-		case STAGE_DESTROY_DYNAMIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_DESTROY_DYNAMIC_REGS_DIR);
-			kset_unregister(priv->dynamic_regs);
-			priv->dynamic_regs = NULL;
-
-		case STAGE_CLEAN_STATIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_CLEAN_STATIC_REGS_DIR);
-			clean_dir(priv->static_regs);
-
-		case STAGE_DESTROY_STATIC_REGS_DIR:
-			PRINT_DSTR_STG(STAGE_DESTROY_STATIC_REGS_DIR);
-			kset_unregister(priv->static_regs);
-			priv->static_regs = NULL;
-
-		case STAGE_DESTROY_POOL:
-			PRINT_DSTR_STG(STAGE_DESTROY_POOL);
-			pool_destroy();
-
-		case STAGE_DESTROY_STATS:
-			PRINT_DSTR_STG(STAGE_DESTROY_STATS);
-			if (priv->stats != NULL)
-			{
-				kfree(priv->stats);
-				priv->stats = NULL;
-			}
-
-		case STAGE_DESTROY_NETDEV:
-			PRINT_DSTR_STG(STAGE_DESTROY_NETDEV);
-			if (mfhss_dev != NULL) 
-			{
-				free_netdev(mfhss_dev);
-				mfhss_dev = NULL;
-			}
-			break;
-		default:
-			mfhss_cleanup(STAGE_DESTROY_ALL, dev);
-	}
-
-
-	// if (mfhss_dev != NULL) 
-	// {
-	// 	// unregister_netdev(mfhss_dev);
-	// 	pool_destroy();
-	// 	free_netdev(mfhss_dev);
-	// 	mfhss_dev = NULL;
-	// }
-}
 static int mfhssnet_probe(struct platform_device *pl_dev)
 {
 	int err = 0;
@@ -701,7 +811,6 @@ static int mfhssnet_probe(struct platform_device *pl_dev)
 	priv->irq_rx = irq_of_parse_and_map(pl_dev->dev.of_node, 0);
 	priv->irq_tx = irq_of_parse_and_map(pl_dev->dev.of_node, 1);
 	PDEBUG("irq_rx=%d, irq_tx=%d\n", priv->irq_rx, priv->irq_tx);
-
 
 	// That's ok! Register the device
 	if ((err = register_netdev(dev)) != 0)

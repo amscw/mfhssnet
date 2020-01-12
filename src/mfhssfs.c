@@ -21,30 +21,6 @@ struct reg_dir {
 //-------------------------------------------------------------------------------------------------
 // MACRO
 //-------------------------------------------------------------------------------------------------
-// hardcoded registers
-#define REG_DMA_CR_NAME			"cr"
-#define REG_DMA_CR_ADDRESS		0x0004
-#define REG_DMA_SR_NAME			"sr"
-#define REG_DMA_SR_ADDRESS		0x0008
-#define REG_DMA_IR_NAME			"ir"
-#define REG_DMA_IR_ADDRESS		0x000C
-#define REG_DMA_SA_NAME			"sa"
-#define REG_DMA_SA_ADDRESS		0x0010
-#define REG_DMA_DA_NAME			"da"
-#define REG_DMA_DA_ADDRESS		0x0014
-#define REG_DMA_SL_NAME			"sl"
-#define REG_DMA_SL_ADDRESS		0x0018
-#define REG_DMA_DL_NAME			"dl"
-#define REG_DMA_DL_ADDRESS		0x001C
-#define REG_MLIP_SR_NAME		"sr"
-#define REG_MLIP_SR_ADDRESS		0x0020
-#define REG_MLIP_IR_NAME		"ir"
-#define REG_MLIP_IR_ADDRESS		0x0024
-#define REG_MLIP_RST_NAME		"rst"
-#define REG_MLIP_RST_ADDRESS	0x0028
-#define REG_MLIP_CE_NAME		"ce"
-#define REG_MLIP_CE_ADDRESS		0x002C
-
 // имя переменной-регистра (атрибута)
 #define REG(dir, reg) reg_##dir##_##reg
 
