@@ -8,6 +8,7 @@
 #include <linux/spinlock.h>		// spinlock_t
 #include <linux/version.h>
 #include <linux/list.h>
+#include <linux/ioport.h>		// FIXME: exclude it from here, need for struct resource
 
 //-------------------------------------------------------------------------------------------------
 // MACRO
