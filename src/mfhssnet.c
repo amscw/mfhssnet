@@ -15,7 +15,7 @@
 #include "mfhssnet.h"
 #include "mfhssfs.h"
 #include "pool.h"
-
+#include "mfhssioctl.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("amscw");			// https://github.com/amscw
@@ -91,7 +91,7 @@ static struct platform_driver mfhssnet_driver = {
 		.probe 		= mfhssnet_probe,
 		.remove		= mfhssnet_remove,
 };
-const char * const destroy_stage_strings[] = {
+static const char * const destroy_stage_strings[] = {
 	"destroying all",
 	"unregister netdev",
 	"clean dynamic regs directory",
@@ -206,7 +206,6 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 		PERR("packet too short (%i octets)", len);
 		return;
 	}
-
 	
 	// Ethhdr is 14 bytes, but the kernel arranges for iphdr
 	ip = (struct iphdr *)(buf + sizeof(struct ethhdr));
@@ -222,7 +221,6 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 	PDEBUG("%08x:%05i --> %08x:%05i\n",
 			ntohl(ip->saddr), ntohs(((struct tcphdr *)(ip+1))->source),
 			ntohl(ip->daddr), ntohs(((struct tcphdr *)(ip+1))->dest));
-	
 	
 	// Ok, now the packet is ready for transmission: first simulate a receive interrupt 
 	// on the twin device, then a transmission-done on the transmitting device
@@ -252,9 +250,6 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 		regular_int_handler(0, dev, NULL);
 	}
 }
-
-
-
 
 // this callback called after allocation net_device structure
 static void mfhss_setup(struct net_device *dev)
@@ -290,9 +285,7 @@ static void mfhss_setup(struct net_device *dev)
 	dev->header_ops = &mfhss_header_ops;
 	
 	rx_int_en(dev, 1);	// enable receive interrupts
-	err = pool_create(dev, ETH_DATA_LEN);
-	PRINT_ERR(err);
-	
+	PRINT_ERR(err);	
 }
 
 // mfhss_cleanup 
@@ -303,7 +296,7 @@ static void mfhss_setup(struct net_device *dev)
 
 static int mfhss_open(struct net_device *dev) 
 {
-	int err = EBUSY;
+	int err = 0;
 	// request_region(), request_irq(), ...
 
 	// Assign the hardware address
@@ -313,7 +306,7 @@ static int mfhss_open(struct net_device *dev)
 		dev->name);
 	netif_start_queue(dev);
 	PRINT_ERR(err);
-	return -err;
+	return err;
 }
 
 static int mfhss_close(struct net_device *dev)
@@ -380,106 +373,62 @@ static int mfhss_tx_pkt(struct sk_buff *skb, struct net_device *dev)
 static int mfhss_ioctl(struct net_device *dev, struct ifreq *req, int cmd)
 {
 	int err = 0;
+	struct mfhss_priv_ *priv = netdev_priv(dev);
+	struct list_head *p;
+	struct kobject *k;
+	unsigned long n;
+	
+	MFHSS_FILE_TypeDef file_descr;
+	MFHSS_DIR_TypeDef dir_descr;
+	
+	if (req == NULL)
+	{
+		PRINT_ERR(err = -EFAULT);
+		return err;
+	}
 
+	// can process
+	switch (cmd)
+	{
+	case MFHSS_IORESET:
+		// TODO: MFHSSDRV_IORESET not implemented
+		PDEBUG("Command 0x%04x (MFHSS_IORESET) @ %s currently not implemented\n", cmd, req->ifr_name);
+		err = -ENOTTY;
+		break;
+
+	case MFHSS_IOMAKEDIR:
+		// PDEBUG("Perform 0x%04x (MFHSS_IOMAKEDIR) @ %s\n", cmd, req->ifr_name);
+		// retrieve directory descriptor
+		copy_from_user(&dir_descr, (const void __user *)req->ifr_data, sizeof dir_descr);
+		// create new directory, based on descriptor
+		err = create_dir(priv->dynamic_regs, priv, dir_descr.nodeName);
+		break;
+
+	case MFHSS_IOMAKEFILE:
+		// забираем описание файла из пространства пользователя
+		// PDEBUG("Perform 0x%04x (MFHSS_IOMAKEFILE)@%s", cmd, req->ifr_name);
+		// retrieve directory descriptor
+		copy_from_user(&file_descr, (const void __user *)req->ifr_data, sizeof file_descr);
+		// try to find subdirectory
+		list_for_each(p, &priv->dynamic_regs->list) 
+		{
+		 	k = list_entry(p, struct kobject, entry);
+		 	if (!strcmp(k->name, file_descr.targetNode))
+		 	{
+		 		// success, try to create file
+		 		err = create_file(k, file_descr.regName, file_descr.address);
+				break;
+			}
+		}
+		break;
+
+	default:
+		PERR("unsupported command: 0x%04x@%s\n", cmd, req->ifr_name);
+		err = -ENOTTY;
+	}
+	PRINT_ERR(err);
 	return err;
 }
-// static long mfhssdrv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
-// {
-// 	int res = 0;
-// 	mfhssdrv_private *charpriv = filp->private_data;
-// 	struct reg_group *g;
-// 	MFHSS_REG_TypeDef reg_descr;
-// 	MFHSS_GROUP_TypeDef group_descr;
-// 	struct list_head *p;
-// 	struct kobject *k;
-// 	struct reg_attribute *a;
-
-// 	// PINFO("In char driver ioctl() function\n");
-
-// 	// validate type
-// 	if (_IOC_TYPE(cmd) != MFHSSDRV_IOC_MAGIC)
-// 		return -ENOTTY;
-// 	// validate number
-// 	if (_IOC_NR(cmd) > MFHSSDRV_IOC_MAXNR)
-// 		return -ENOTTY;
-// 	// validate access
-// 	if (_IOC_DIR(cmd) & _IOC_READ)
-// 		res = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
-// 	else if (_IOC_DIR(cmd) & _IOC_WRITE)
-// 		res = !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
-// 	if (res)
-// 		return -EFAULT;
-
-// 	// can process
-// 	switch (cmd)
-// 	{
-// 	case MFHSSDRV_IORESET:
-// 		PDEBUG("Performing reset\n");
-// 		// TODO: MFHSSDRV_IORESET not implemented
-// 		break;
-
-// 	case MFHSSDRV_IOMAKEGROUP:
-// 		// забираем описание группы
-// 		copy_from_user(&group_descr, (const void __user *)arg, sizeof group_descr);
-// 		// выделяем память под новый объект
-// 		g = kzalloc(sizeof *g, GFP_KERNEL);
-// 		if (!g)
-// 		{
-// 			PERR("Failed to alloc group object %s\n", group_descr.nodeName);
-// 			return -ENOMEM;
-// 		}
-// 		// настраиваем его и регистрируем
-// 		kobject_init(&g->kobj, &reg_type);
-// 		g->kobj.kset = charpriv->dynamic_regs;
-// 		g->charpriv = charpriv;
-// 		res = kobject_add(&g->kobj, &charpriv->dynamic_regs->kobj, "%s", group_descr.nodeName);	// будем надеяться, что name будет скопирован.
-// 		if (res != 0)
-// 		{
-// 			PERR("Failed to register group object %s\n", group_descr.nodeName);
-// 			kobject_put(&g->kobj); // будет вызван release, который удалит reg
-// 			return -ENOMEM;
-// 		}
-// 		PDEBUG("New group added successfully (%s)\n", group_descr.nodeName);
-// 		break;
-
-// 	case MFHSSDRV_IOMAKEREG:
-// 		// забираем описание регистра из пространства пользователя
-// 		copy_from_user(&reg_descr, (const void __user *)arg, sizeof reg_descr);
-// 		// поиск указанной группы
-// 		list_for_each(p, &charpriv->dynamic_regs->list) {
-// 			k = list_entry(p, struct kobject, entry);
-// 			if (!strcmp(k->name, reg_descr.targetNode))
-// 			{
-// 				a = kzalloc (sizeof *a, GFP_KERNEL);
-// 				if (!a)
-// 				{
-// 					PERR("Failed to allocate attribute %s\n", reg_descr.regName);
-// 					return -ENOMEM;
-// 				}
-// 				a->address = reg_descr.address;
-// 				strcpy(a->name, reg_descr.regName);
-// 				a->default_attribute.name = a->name;
-// 				a->default_attribute.mode = S_IRUGO | S_IWUSR;
-// 				res = sysfs_create_file(k, &a->default_attribute);
-// 				if (res != 0)
-// 				{
-// 					PERR("Failed to register attribute %s\n", reg_descr.regName);
-// 					kfree(a);
-// 					return -ENOMEM;
-// 				}
-// 				PDEBUG("New attribute %s added to group %s\n", reg_descr.regName, reg_descr.targetNode);
-// 				break;
-// 			}
-// 		}
-// 		break;
-
-// 	default:
-// 		PERR("unsupported command: 0x%x\n", cmd);
-// 		return -ENOTTY;
-// 	}
-
-// 	return 0;
-// }
 
 
 static int mfhss_change_mtu(struct net_device *dev, int new_mtu)
