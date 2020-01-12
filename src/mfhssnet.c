@@ -721,7 +721,11 @@ static int mfhssnet_probe(struct platform_device *pl_dev)
 
 static int mfhssnet_remove (struct platform_device *pl_dev)
 {
-	return 0;
+	int err = 0;
+
+	// this function never call
+	PRINT_ERR(err);
+	return err;
 }
 
 /*
@@ -739,6 +743,7 @@ static __init int mfhss_init(void)
 static __exit void mfhss_exit(void)
 {	
 	mfhss_cleanup(STAGE_DESTROY_ALL, mfhss_dev);
+	platform_driver_unregister(&mfhssnet_driver);
 }
 
 module_init(mfhss_init);
