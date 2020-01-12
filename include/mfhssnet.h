@@ -33,19 +33,33 @@ struct mfhss_pkt_
 
 // Main device structure
 struct mfhss_priv_ {
+	// platform data
+	struct resource resource;
+	void __iomem *io_base;
+	char *src_addr;
+	char *dst_addr;
+	dma_addr_t src_handle;
+	dma_addr_t dst_handle;
+	int irq_rx;
+	int irq_tx;
+
+	// network data
 	struct net_device *dev;
 	struct net_device_stats *stats;
-	void __iomem *io_base;
-	int status;
-	struct mfhss_pkt_ *pool;			// Pointer to last item in list
-	struct mfhss_pkt_ *rx_queue;		// List of incoming packets 
-	int rx_int_en;
+	struct sk_buff *skb;
 	int tx_pkt_len;
 	u8 *tx_pkt_data;
-	struct sk_buff *skb;
+
+	// locker
 	spinlock_t lock;
+	
+	// sysfs data
 	struct kset *static_regs;
 	struct kset *dynamic_regs;
+	
+	// not use (compat) 
+	int status;
+	int rx_int_en;
 };
 
 

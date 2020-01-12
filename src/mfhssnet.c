@@ -24,7 +24,9 @@ MODULE_AUTHOR("amscw");			// https://github.com/amscw
 //-------------------------------------------------------------------------------------------------
 // MACRO
 //-------------------------------------------------------------------------------------------------
-#define PRINT_DSTR_STG(from) PDEBUG("stage%i:%s...\n", from, destroy_stage_strings[from]);
+#define PRINT_DSTR_STG(from) PDEBUG("stage%i:%s...\n", from, destroy_stage_strings[from])
+#define REG_WR(p, a, v) iowrite32(v, (void __iomem *)(p->io_base + a)) 
+#define REG_RD(p, a) ioread32((void __iomem *)(p->io_base + a))
 
 //-------------------------------------------------------------------------------------------------
 // Types
@@ -32,6 +34,8 @@ MODULE_AUTHOR("amscw");			// https://github.com/amscw
 enum destroy_stage_ {
 	STAGE_DESTROY_ALL,
 	STAGE_UNREGISTER_NETDEV,
+	STAGE_UNMAP_MEM_REGION,
+	STAGE_DESTROY_MEM_REGION,
 	STAGE_CLEAN_DYNAMIC_REGS_DIR,
 	STAGE_DESTROY_DYNAMIC_REGS_DIR,
 	STAGE_CLEAN_STATIC_REGS_DIR,
@@ -60,7 +64,7 @@ static int mfhssnet_remove(struct platform_device *pl_dev);
 //-------------------------------------------------------------------------------------------------
 // Varibles
 //-------------------------------------------------------------------------------------------------
-struct net_device *mfhss_dev;
+// struct net_device *mfhss_dev;	// FIXME no need to hold this var, use platform_data instead!
 static const struct net_device_ops mfhss_net_device_ops = {
  	.ndo_open            = mfhss_open,
  	.ndo_stop            = mfhss_close,
@@ -94,6 +98,8 @@ static struct platform_driver mfhssnet_driver = {
 static const char * const destroy_stage_strings[] = {
 	"destroying all",
 	"unregister netdev",
+	"unmapping memory region",
+	"free io memory region",
 	"clean dynamic regs directory",
 	"destroying dynamic regs directory",
 	"clean static regs directory",
@@ -109,6 +115,25 @@ static const char * const destroy_stage_strings[] = {
 /*
  * Net device support
  */
+static char *ipaddr_to_str(u32 ipaddr)
+{
+	static char iptable[10][16];
+	static int index = 0;
+	union
+	{
+		u32 word;
+		u8 bytes[sizeof (u32)];
+	} tmp = { ntohl(ipaddr) };
+	char *str = &iptable[index][0];
+
+	sprintf(str, "%d.%d.%d.%d", tmp.bytes[3], tmp.bytes[2], tmp.bytes[1], tmp.bytes[0]);
+
+	if (++index == sizeof iptable / sizeof *iptable)
+		index = 0;
+
+	return str;
+}
+
 static void rx_int_en(struct net_device *dev, int enable)
 {
 	struct mfhss_priv_ *priv = netdev_priv(dev);
@@ -212,15 +237,18 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 	saddr = &ip->saddr;
 	daddr = &ip->daddr;
 
-	((u8 *)saddr)[2] ^= 1; // change the third octet (class C)
-	((u8 *)daddr)[2] ^= 1;
+	((u8*)saddr)[2] ^= 1; // change the third octet (class C)
+	((u8*)daddr)[2] ^= 1;
 
 	ip->check = 0;         // and rebuild the checksum (ip needs it)
 	ip->check = ip_fast_csum((unsigned char *)ip, ip->ihl);
 
-	PDEBUG("%08x:%05i --> %08x:%05i\n",
-			ntohl(ip->saddr), ntohs(((struct tcphdr *)(ip+1))->source),
-			ntohl(ip->daddr), ntohs(((struct tcphdr *)(ip+1))->dest));
+	PDEBUG("%s:%05i --> %s:%05i",
+		ipaddr_to_str(ip->saddr),ntohs(((struct tcphdr *)(ip+1))->source),
+		ipaddr_to_str(ip->daddr),ntohs(((struct tcphdr *)(ip+1))->dest));
+	// PDEBUG("%08x:%05i --> %08x:%05i\n",
+	// 		ntohl(ip->saddr), ntohs(((struct tcphdr *)(ip+1))->source),
+	// 		ntohl(ip->daddr), ntohs(((struct tcphdr *)(ip+1))->dest));
 	
 	// Ok, now the packet is ready for transmission: first simulate a receive interrupt 
 	// on the twin device, then a transmission-done on the transmitting device
@@ -248,6 +276,7 @@ static void tx_pkt_by_hw(char *buf, int len, struct net_device *dev)
 		priv->tx_pkt_data = buf;
 		priv->status |= DUMMY_NETDEV_TX_INTR;
 		regular_int_handler(0, dev, NULL);
+		pool_put(tx_buffer);
 	}
 }
 
@@ -376,7 +405,6 @@ static int mfhss_ioctl(struct net_device *dev, struct ifreq *req, int cmd)
 	struct mfhss_priv_ *priv = netdev_priv(dev);
 	struct list_head *p;
 	struct kobject *k;
-	unsigned long n;
 	
 	MFHSS_FILE_TypeDef file_descr;
 	MFHSS_DIR_TypeDef dir_descr;
@@ -510,6 +538,13 @@ static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
 			PRINT_DSTR_STG(STAGE_UNREGISTER_NETDEV);
 			unregister_netdev(dev);
 
+		case STAGE_UNMAP_MEM_REGION:
+			iounmap(priv->io_base);
+
+		case STAGE_DESTROY_MEM_REGION:
+			PRINT_DSTR_STG(STAGE_DESTROY_MEM_REGION);
+			release_mem_region(priv->resource.start, resource_size(&priv->resource));
+
 		case STAGE_CLEAN_DYNAMIC_REGS_DIR:
 			PRINT_DSTR_STG(STAGE_CLEAN_DYNAMIC_REGS_DIR);
 			clean_dir(priv->dynamic_regs);
@@ -563,7 +598,125 @@ static void mfhss_cleanup(enum destroy_stage_ from, struct net_device *dev)
 }
 static int mfhssnet_probe(struct platform_device *pl_dev)
 {
-	return -1;
+	int err = 0;
+	struct net_device *dev;
+	struct mfhss_priv_ *priv;
+
+	// Allocate the device
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
+	dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", mfhss_setup);
+#else
+	dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", NET_NAME_UNKNOWN, mfhss_setup);
+#endif
+	if (dev == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		return err;
+	} 
+	priv = netdev_priv(dev);
+	
+	// Allocate interface stats
+	priv->stats = kzalloc(sizeof *(priv->stats), GFP_KERNEL);
+	if (priv == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_NETDEV, dev);
+		return err;
+	}
+
+	// Allocate pool
+	err = pool_create(dev, ETH_DATA_LEN);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		mfhss_cleanup(STAGE_DESTROY_STATS, dev);
+		return err;
+	}
+
+	// Create static registers directory in sysfs
+	priv->static_regs = kset_create_and_add("mfhss-static", NULL, NULL);
+	if (priv->static_regs == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_POOL, dev);
+		return err;
+	}
+	
+	// Create static registers subdirectories and files
+	err = create_dma_subdir(priv->static_regs, priv);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		// ниодной поддиректории не было создано, так что просто сносим каталог
+		mfhss_cleanup(STAGE_DESTROY_STATIC_REGS_DIR, dev);
+		return err;
+	}
+	err = create_mlip_subdir(priv->static_regs, priv);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		// если была создана хотя бы одна поддиректория, нужно вызывать очистку каталога, и только потом его снос
+		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, dev);
+		return err;
+	}
+
+	// Create dynamic registers directory in sysfs
+	priv->dynamic_regs = kset_create_and_add("mfhss-dynamic", NULL, NULL);
+	if (priv->dynamic_regs == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, dev);
+		return err;
+	}
+	// all subdirectories will be create dinamically
+
+	// извлечь диапазон физических адресов
+	err = of_address_to_resource(pl_dev->dev.of_node, 0, &priv->resource);
+	if (err != 0)
+	{
+		PRINT_ERR(err);
+		mfhss_cleanup(STAGE_CLEAN_DYNAMIC_REGS_DIR, dev);
+		return err;
+	}
+	PDEBUG("physical memory range: 0x%llx-0x%llx\n", priv->resource.start, priv->resource.end);
+
+	// запрос адресного проcтранства у ядра, чтобы не возникло коллизии с другими модулями
+	if (request_mem_region(priv->resource.start, resource_size(&priv->resource), DRIVER_NAME) == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_CLEAN_DYNAMIC_REGS_DIR, dev);
+		return err;
+	}
+
+	// маппинг физических адресов на виртуальные
+	priv->io_base = of_iomap(pl_dev->dev.of_node, 0);
+	if (priv->io_base == NULL)
+	{
+		PRINT_ERR(err = -ENOMEM);
+		mfhss_cleanup(STAGE_DESTROY_MEM_REGION, dev);
+		return err;
+	}
+	
+	// извлечь номера прерываний
+	priv->irq_rx = irq_of_parse_and_map(pl_dev->dev.of_node, 0);
+	priv->irq_tx = irq_of_parse_and_map(pl_dev->dev.of_node, 1);
+	PDEBUG("irq_rx=%d, irq_tx=%d\n", priv->irq_rx, priv->irq_tx);
+
+
+	// That's ok! Register the device
+	if ((err = register_netdev(dev)) != 0)
+	{
+		PRINT_ERR(err);
+		mfhss_cleanup(STAGE_UNMAP_MEM_REGION, dev);
+		return err;
+	} 
+	PDEBUG("%s successfully registered!", dev->name);
+
+	// now save it
+	platform_set_drvdata(pl_dev, dev);
+
+	PRINT_ERR(err);
+	return err;
 }
 
 static int mfhssnet_remove (struct platform_device *pl_dev)
@@ -576,94 +729,9 @@ static int mfhssnet_remove (struct platform_device *pl_dev)
  */
 static __init int mfhss_init(void)
 {
-	// int err = 0;
-
-	// err = platform_driver_register(&mfhssnet_driver);
-	// PRINT_ERR(err);
-	// return err;
-
-
 	int err = 0;
-	struct mfhss_priv_ *priv;
 
-	// Allocate the device
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
-	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", mfhss_setup);
-#else
-	mfhss_dev = alloc_netdev(sizeof (struct mfhss_priv_), "mfhss%d", NET_NAME_UNKNOWN, mfhss_setup);
-#endif
-	if (mfhss_dev == NULL)
-	{
-		PRINT_ERR(err = -ENOMEM);
-		return err;
-	} 
-	priv = netdev_priv(mfhss_dev);
-	
-	// Allocate interface stats
-	priv->stats = kzalloc(sizeof *(priv->stats), GFP_KERNEL);
-	if (priv == NULL)
-	{
-		PRINT_ERR(err = -ENOMEM);
-		mfhss_cleanup(STAGE_DESTROY_NETDEV, mfhss_dev);
-		return err;
-	}
-
-	// Allocate pool
-	err = pool_create(mfhss_dev, ETH_DATA_LEN);
-	if (err != 0)
-	{
-		PRINT_ERR(err);
-		mfhss_cleanup(STAGE_DESTROY_STATS, mfhss_dev);
-		return err;
-	}
-
-	// Allocation private data ok, now save it
-	// platform_set_drvdata(pl_dev, priv);	// or save mfhss_dev ?
-
-	// Create static registers directory in sysfs
-	priv->static_regs = kset_create_and_add("mfhss-static", NULL, NULL);
-	if (priv->static_regs == NULL)
-	{
-		PRINT_ERR(err = -ENOMEM);
-		mfhss_cleanup(STAGE_DESTROY_POOL, mfhss_dev);
-		return err;
-	}
-	
-	// Create static registers subdirectories and files
-	err = create_dma_subdir(priv->static_regs, priv);
-	if (err != 0)
-	{
-		PRINT_ERR(err);
-		// ниодной поддиректории не было создано, так что просто сносим каталог
-		mfhss_cleanup(STAGE_DESTROY_STATIC_REGS_DIR, mfhss_dev);
-		return err;
-	}
-	err = create_mlip_subdir(priv->static_regs, priv);
-	if (err != 0)
-	{
-		PRINT_ERR(err);
-		// если была создана хотя бы одна поддиректория, нужно вызывать очистку каталога, и только потом его снос
-		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, mfhss_dev);
-		return err;
-	}
-
-	// Create dynamic registers directory in sysfs
-	priv->dynamic_regs = kset_create_and_add("mfhss-dynamic", NULL, NULL);
-	if (priv->dynamic_regs == NULL)
-	{
-		PRINT_ERR(err = -ENOMEM);
-		mfhss_cleanup(STAGE_CLEAN_STATIC_REGS_DIR, mfhss_dev);
-		return err;
-	}
-	// all subdirectories will be create dinamically
-
-	// Register devices
-	if ((err = register_netdev(mfhss_dev)) != 0)
-	{
-		PRINT_ERR(err);
-		mfhss_cleanup(STAGE_CLEAN_DYNAMIC_REGS_DIR, mfhss_dev);
-		return err;
-	} else PDEBUG("%s successfully registered!", mfhss_dev->name);
+	err = platform_driver_register(&mfhssnet_driver);
 	PRINT_ERR(err);
 	return err;
 }
